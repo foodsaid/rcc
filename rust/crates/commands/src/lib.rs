@@ -89,8 +89,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "config",
-        summary: "Inspect discovered Claude config files",
-        argument_hint: None,
+        summary: "Inspect Claude config files or merged sections",
+        argument_hint: Some("[env|hooks|model]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -117,7 +117,7 @@ pub enum SlashCommand {
     Clear { confirm: bool },
     Cost,
     Resume { session_path: Option<String> },
-    Config,
+    Config { section: Option<String> },
     Memory,
     Init,
     Unknown(String),
@@ -150,7 +150,9 @@ impl SlashCommand {
             "resume" => Self::Resume {
                 session_path: parts.next().map(ToOwned::to_owned),
             },
-            "config" => Self::Config,
+            "config" => Self::Config {
+                section: parts.next().map(ToOwned::to_owned),
+            },
             "memory" => Self::Memory,
             "init" => Self::Init,
             other => Self::Unknown(other.to_string()),
@@ -230,7 +232,7 @@ pub fn handle_slash_command(
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
         | SlashCommand::Resume { .. }
-        | SlashCommand::Config
+        | SlashCommand::Config { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
         | SlashCommand::Unknown(_) => None,
@@ -280,7 +282,16 @@ mod tests {
                 session_path: Some("session.json".to_string()),
             })
         );
-        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(
+            SlashCommand::parse("/config"),
+            Some(SlashCommand::Config { section: None })
+        );
+        assert_eq!(
+            SlashCommand::parse("/config env"),
+            Some(SlashCommand::Config {
+                section: Some("env".to_string())
+            })
+        );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
     }
@@ -297,7 +308,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config"));
+        assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert_eq!(slash_command_specs().len(), 11);
@@ -370,5 +381,8 @@ mod tests {
         )
         .is_none());
         assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
+        );
     }
 }

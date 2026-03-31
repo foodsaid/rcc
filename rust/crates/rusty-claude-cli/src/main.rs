@@ -446,9 +446,9 @@ fn run_resume_command(
                 message: Some(format_cost_report(usage)),
             })
         }
-        SlashCommand::Config => Ok(ResumeCommandOutcome {
+        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(render_config_report()?),
+            message: Some(render_config_report(section.as_deref())?),
         }),
         SlashCommand::Memory => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -554,7 +554,7 @@ impl LiveCli {
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => self.print_cost(),
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
-            SlashCommand::Config => Self::print_config()?,
+            SlashCommand::Config { section } => Self::print_config(section.as_deref())?,
             SlashCommand::Memory => Self::print_memory()?,
             SlashCommand::Init => Self::run_init()?,
             SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
@@ -708,8 +708,8 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_config() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_config_report()?);
+    fn print_config(section: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_config_report(section)?);
         Ok(())
     }
 
@@ -830,7 +830,7 @@ fn format_status_report(
     )
 }
 
-fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
+fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered = loader.discover();
@@ -868,6 +868,36 @@ fn render_config_report() -> Result<String, Box<dyn std::error::Error>> {
             entry.path.display()
         ));
     }
+
+    if let Some(section) = section {
+        lines.push(format!("Merged section: {section}"));
+        let value = match section {
+            "env" => runtime_config.get("env"),
+            "hooks" => runtime_config.get("hooks"),
+            "model" => runtime_config.get("model"),
+            other => {
+                lines.push(format!(
+                    "  Unsupported config section '{other}'. Use env, hooks, or model."
+                ));
+                return Ok(lines.join(
+                    "
+",
+                ));
+            }
+        };
+        lines.push(format!(
+            "  {}",
+            match value {
+                Some(value) => value.render(),
+                None => "<unset>".to_string(),
+            }
+        ));
+        return Ok(lines.join(
+            "
+",
+        ));
+    }
+
     lines.push("Merged JSON".to_string());
     lines.push(format!("  {}", runtime_config.as_json().render()));
     Ok(lines.join(
@@ -1340,7 +1370,7 @@ mod tests {
         format_cost_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_resume_report,
         format_status_report, normalize_permission_mode, parse_args, parse_git_status_metadata,
-        render_init_claude_md, render_memory_report, render_repl_help,
+        render_config_report, render_init_claude_md, render_memory_report, render_repl_help,
         resume_supported_slash_commands, status_context, CliAction, SlashCommand, StatusUsage,
         DEFAULT_MODEL,
     };
@@ -1447,7 +1477,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config"));
+        assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/exit"));
@@ -1572,6 +1602,12 @@ mod tests {
     }
 
     #[test]
+    fn config_report_supports_section_views() {
+        let report = render_config_report(Some("env")).expect("config report should render");
+        assert!(report.contains("Merged section: env"));
+    }
+
+    #[test]
     fn memory_report_uses_sectioned_layout() {
         let report = render_memory_report().expect("memory report should render");
         assert!(report.contains("Memory"));
@@ -1582,7 +1618,7 @@ mod tests {
 
     #[test]
     fn config_report_uses_sectioned_layout() {
-        let report = super::render_config_report().expect("config report should render");
+        let report = render_config_report(None).expect("config report should render");
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
@@ -1644,7 +1680,16 @@ mod tests {
             SlashCommand::parse("/clear --confirm"),
             Some(SlashCommand::Clear { confirm: true })
         );
-        assert_eq!(SlashCommand::parse("/config"), Some(SlashCommand::Config));
+        assert_eq!(
+            SlashCommand::parse("/config"),
+            Some(SlashCommand::Config { section: None })
+        );
+        assert_eq!(
+            SlashCommand::parse("/config env"),
+            Some(SlashCommand::Config {
+                section: Some("env".to_string())
+            })
+        );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
     }
