@@ -201,8 +201,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
-        name: "plugin",
-        aliases: &["plugins", "marketplace"],
+        name: "plugins",
+        aliases: &["plugin", "marketplace"],
         summary: "Manage Claude Code plugins",
         argument_hint: Some(
             "[list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]",
@@ -1229,7 +1229,7 @@ mod tests {
         assert!(help.contains(
             "/plugins [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
         ));
-        assert_eq!(slash_command_specs().len(), 23);
+        assert_eq!(slash_command_specs().len(), 25);
         assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 

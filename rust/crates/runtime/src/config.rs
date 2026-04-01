@@ -52,6 +52,7 @@ pub struct RuntimeFeatureConfig {
     oauth: Option<OAuthConfig>,
     model: Option<String>,
     permission_mode: Option<ResolvedPermissionMode>,
+    permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
 }
 
@@ -59,6 +60,14 @@ pub struct RuntimeFeatureConfig {
 pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
+    post_tool_use_failure: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimePermissionRuleConfig {
+    allow: Vec<String>,
+    deny: Vec<String>,
+    ask: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -248,6 +257,7 @@ impl ConfigLoader {
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
             permission_mode: parse_optional_permission_mode(&merged_value)?,
+            permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
         };
 
@@ -325,6 +335,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
+        &self.feature_config.permission_rules
+    }
+
+    #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
@@ -371,6 +386,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
         self.permission_mode
+    }
+
+    #[must_use]
+    pub fn permission_rules(&self) -> &RuntimePermissionRuleConfig {
+        &self.permission_rules
     }
 
     #[must_use]
@@ -428,10 +448,15 @@ pub fn default_config_home() -> PathBuf {
 
 impl RuntimeHookConfig {
     #[must_use]
-    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>) -> Self {
+    pub fn new(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+    ) -> Self {
         Self {
             pre_tool_use,
             post_tool_use,
+            post_tool_use_failure,
         }
     }
 
@@ -446,6 +471,11 @@ impl RuntimeHookConfig {
     }
 
     #[must_use]
+    pub fn post_tool_use_failure(&self) -> &[String] {
+        &self.post_tool_use_failure
+    }
+
+    #[must_use]
     pub fn merged(&self, other: &Self) -> Self {
         let mut merged = self.clone();
         merged.extend(other);
@@ -455,6 +485,32 @@ impl RuntimeHookConfig {
     pub fn extend(&mut self, other: &Self) {
         extend_unique(&mut self.pre_tool_use, other.pre_tool_use());
         extend_unique(&mut self.post_tool_use, other.post_tool_use());
+        extend_unique(
+            &mut self.post_tool_use_failure,
+            other.post_tool_use_failure(),
+        );
+    }
+}
+
+impl RuntimePermissionRuleConfig {
+    #[must_use]
+    pub fn new(allow: Vec<String>, deny: Vec<String>, ask: Vec<String>) -> Self {
+        Self { allow, deny, ask }
+    }
+
+    #[must_use]
+    pub fn allow(&self) -> &[String] {
+        &self.allow
+    }
+
+    #[must_use]
+    pub fn deny(&self) -> &[String] {
+        &self.deny
+    }
+
+    #[must_use]
+    pub fn ask(&self) -> &[String] {
+        &self.ask
     }
 }
 
@@ -568,6 +624,32 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
         pre_tool_use: optional_string_array(hooks, "PreToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
         post_tool_use: optional_string_array(hooks, "PostToolUse", "merged settings.hooks")?
+            .unwrap_or_default(),
+        post_tool_use_failure: optional_string_array(
+            hooks,
+            "PostToolUseFailure",
+            "merged settings.hooks",
+        )?
+        .unwrap_or_default(),
+    })
+}
+
+fn parse_optional_permission_rules(
+    root: &JsonValue,
+) -> Result<RuntimePermissionRuleConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimePermissionRuleConfig::default());
+    };
+    let Some(permissions) = object.get("permissions").and_then(JsonValue::as_object) else {
+        return Ok(RuntimePermissionRuleConfig::default());
+    };
+
+    Ok(RuntimePermissionRuleConfig {
+        allow: optional_string_array(permissions, "allow", "merged settings.permissions")?
+            .unwrap_or_default(),
+        deny: optional_string_array(permissions, "deny", "merged settings.permissions")?
+            .unwrap_or_default(),
+        ask: optional_string_array(permissions, "ask", "merged settings.permissions")?
             .unwrap_or_default(),
     })
 }
@@ -991,7 +1073,7 @@ mod tests {
         .expect("write user compat config");
         fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan"}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan","allow":["Read"],"deny":["Bash(rm -rf)"]}}"#,
         )
         .expect("write user settings");
         fs::write(
@@ -1001,7 +1083,7 @@ mod tests {
         .expect("write project compat config");
         fs::write(
             cwd.join(".claude").join("settings.json"),
-            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
+            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
@@ -1046,6 +1128,16 @@ mod tests {
             .contains_key("PostToolUse"));
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
+        assert_eq!(
+            loaded.hooks().post_tool_use_failure(),
+            &["project-failure".to_string()]
+        );
+        assert_eq!(loaded.permission_rules().allow(), &["Read".to_string()]);
+        assert_eq!(
+            loaded.permission_rules().deny(),
+            &["Bash(rm -rf)".to_string()]
+        );
+        assert_eq!(loaded.permission_rules().ask(), &["Edit".to_string()]);
         assert!(loaded.mcp().get("home").is_some());
         assert!(loaded.mcp().get("project").is_some());
 
