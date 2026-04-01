@@ -58,6 +58,12 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "thinking",
+        summary: "Show or toggle extended thinking",
+        argument_hint: Some("[on|off]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "model",
         summary: "Show or switch the active model",
         argument_hint: Some("[model]"),
@@ -136,6 +142,9 @@ pub enum SlashCommand {
     Help,
     Status,
     Compact,
+    Thinking {
+        enabled: Option<bool>,
+    },
     Model {
         model: Option<String>,
     },
@@ -180,6 +189,13 @@ impl SlashCommand {
             "help" => Self::Help,
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "thinking" => Self::Thinking {
+                enabled: match parts.next() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    Some(_) | None => None,
+                },
+            },
             "model" => Self::Model {
                 model: parts.next().map(ToOwned::to_owned),
             },
@@ -279,6 +295,7 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
+        | SlashCommand::Thinking { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
@@ -307,6 +324,22 @@ mod tests {
     fn parses_supported_slash_commands() {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse(" /status "), Some(SlashCommand::Status));
+        assert_eq!(
+            SlashCommand::parse("/thinking on"),
+            Some(SlashCommand::Thinking {
+                enabled: Some(true),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/thinking off"),
+            Some(SlashCommand::Thinking {
+                enabled: Some(false),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/thinking"),
+            Some(SlashCommand::Thinking { enabled: None })
+        );
         assert_eq!(
             SlashCommand::parse("/model claude-opus"),
             Some(SlashCommand::Model {
@@ -374,6 +407,7 @@ mod tests {
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
+        assert!(help.contains("/thinking [on|off]"));
         assert!(help.contains("/model [model]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
@@ -386,7 +420,7 @@ mod tests {
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>]"));
-        assert_eq!(slash_command_specs().len(), 15);
+        assert_eq!(slash_command_specs().len(), 16);
         assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 
@@ -434,6 +468,9 @@ mod tests {
         let session = Session::new();
         assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_none());
         assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/thinking on", &session, CompactionConfig::default()).is_none()
+        );
         assert!(
             handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
         );

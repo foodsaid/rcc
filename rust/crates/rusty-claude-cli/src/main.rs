@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use api::{
     resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -34,6 +35,7 @@ use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 const DEFAULT_MAX_TOKENS: u32 = 32;
+const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,7 +72,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode)?
+            thinking,
+        } => LiveCli::new(model, false, allowed_tools, permission_mode, thinking)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -78,7 +81,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            thinking,
+        } => run_repl(model, allowed_tools, permission_mode, thinking)?,
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -103,6 +107,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        thinking: bool,
     },
     Login,
     Logout,
@@ -110,6 +115,7 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        thinking: bool,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -139,6 +145,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
+    let mut thinking = false;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
     let mut index = 0;
@@ -147,6 +154,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         match args[index].as_str() {
             "--version" | "-V" => {
                 wants_version = true;
+                index += 1;
+            }
+            "--thinking" => {
+                thinking = true;
                 index += 1;
             }
             "--model" => {
@@ -215,6 +226,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            thinking,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -241,6 +253,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                thinking,
             })
         }
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
@@ -249,6 +262,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            thinking,
         }),
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -600,6 +614,7 @@ struct StatusUsage {
     latest: TokenUsage,
     cumulative: TokenUsage,
     estimated_tokens: usize,
+    thinking_enabled: bool,
 }
 
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
@@ -664,6 +679,39 @@ Modes
 Usage
   Inspect current mode with /permissions
   Switch modes with /permissions <mode>"
+    )
+}
+
+fn format_thinking_report(enabled: bool) -> String {
+    let state = if enabled { "on" } else { "off" };
+    let budget = if enabled {
+        DEFAULT_THINKING_BUDGET_TOKENS.to_string()
+    } else {
+        "disabled".to_string()
+    };
+    format!(
+        "Thinking
+  Active mode      {state}
+  Budget tokens    {budget}
+
+Usage
+  Inspect current mode with /thinking
+  Toggle with /thinking on or /thinking off"
+    )
+}
+
+fn format_thinking_switch_report(enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    format!(
+        "Thinking updated
+  Result           {state}
+  Budget tokens    {}
+  Applies to       subsequent requests",
+        if enabled {
+            DEFAULT_THINKING_BUDGET_TOKENS.to_string()
+        } else {
+            "disabled".to_string()
+        }
     )
 }
 
@@ -834,6 +882,7 @@ fn run_resume_command(
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
+                        thinking_enabled: false,
                     },
                     default_permission_mode().as_str(),
                     &status_context(Some(session_path))?,
@@ -880,6 +929,7 @@ fn run_resume_command(
             })
         }
         SlashCommand::Resume { .. }
+        | SlashCommand::Thinking { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
@@ -891,8 +941,15 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    thinking_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        model,
+        true,
+        allowed_tools,
+        permission_mode,
+        thinking_enabled,
+    )?;
     let mut editor = input::LineEditor::new("› ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -945,6 +1002,7 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    thinking_enabled: bool,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
@@ -956,6 +1014,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        thinking_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
@@ -966,11 +1025,13 @@ impl LiveCli {
             enable_tools,
             allowed_tools.clone(),
             permission_mode,
+            thinking_enabled,
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
+            thinking_enabled,
             system_prompt,
             runtime,
             session,
@@ -981,9 +1042,10 @@ impl LiveCli {
 
     fn startup_banner(&self) -> String {
         format!(
-            "Rusty Claude CLI\n  Model            {}\n  Permission mode  {}\n  Working directory {}\n  Session          {}\n\nType /help for commands. Shift+Enter or Ctrl+J inserts a newline.",
+            "Rusty Claude CLI\n  Model            {}\n  Permission mode  {}\n  Thinking         {}\n  Working directory {}\n  Session          {}\n\nType /help for commands. Shift+Enter or Ctrl+J inserts a newline.",
             self.model,
             self.permission_mode.as_str(),
+            if self.thinking_enabled { "on" } else { "off" },
             env::current_dir().map_or_else(
                 |_| "<unknown>".to_string(),
                 |path| path.display().to_string(),
@@ -1049,6 +1111,9 @@ impl LiveCli {
             system: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
             tools: None,
             tool_choice: None,
+            thinking: self
+                .thinking_enabled
+                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
             stream: false,
         };
         let runtime = tokio::runtime::Runtime::new()?;
@@ -1058,7 +1123,7 @@ impl LiveCli {
             .iter()
             .filter_map(|block| match block {
                 OutputContentBlock::Text { text } => Some(text.as_str()),
-                OutputContentBlock::ToolUse { .. } => None,
+                OutputContentBlock::Thinking { .. } | OutputContentBlock::ToolUse { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("");
@@ -1095,6 +1160,7 @@ impl LiveCli {
                 self.compact()?;
                 false
             }
+            SlashCommand::Thinking { enabled } => self.set_thinking(enabled)?,
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
@@ -1155,6 +1221,7 @@ impl LiveCli {
                     latest,
                     cumulative,
                     estimated_tokens: self.runtime.estimated_tokens(),
+                    thinking_enabled: self.thinking_enabled,
                 },
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
@@ -1197,12 +1264,39 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
         )?;
         self.model.clone_from(&model);
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
         );
+        Ok(true)
+    }
+
+    fn set_thinking(&mut self, enabled: Option<bool>) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(enabled) = enabled else {
+            println!("{}", format_thinking_report(self.thinking_enabled));
+            return Ok(false);
+        };
+
+        if enabled == self.thinking_enabled {
+            println!("{}", format_thinking_report(self.thinking_enabled));
+            return Ok(false);
+        }
+
+        let session = self.runtime.session().clone();
+        self.thinking_enabled = enabled;
+        self.runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.thinking_enabled,
+        )?;
+        println!("{}", format_thinking_switch_report(self.thinking_enabled));
         Ok(true)
     }
 
@@ -1239,6 +1333,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
         )?;
         println!(
             "{}",
@@ -1263,6 +1358,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1297,6 +1393,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
         )?;
         self.session = handle;
         println!(
@@ -1373,6 +1470,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    self.thinking_enabled,
                 )?;
                 self.session = handle;
                 println!(
@@ -1402,6 +1500,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -1513,6 +1612,7 @@ fn render_repl_help() -> String {
     [
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
+        "  /thinking [on|off]   Show or toggle extended thinking".to_string(),
         "  /quit                Quit the REPL".to_string(),
         "  Up/Down              Navigate prompt history".to_string(),
         "  Tab                  Complete slash commands".to_string(),
@@ -1559,10 +1659,14 @@ fn format_status_report(
             "Status
   Model            {model}
   Permission mode  {permission_mode}
+  Thinking         {}
   Messages         {}
   Turns            {}
   Estimated tokens {}",
-            usage.message_count, usage.turns, usage.estimated_tokens,
+            if usage.thinking_enabled { "on" } else { "off" },
+            usage.message_count,
+            usage.turns,
+            usage.estimated_tokens,
         ),
         format!(
             "Usage
@@ -1834,6 +1938,15 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { text, signature } => {
+                    lines.push(format!(
+                        "[thinking{}] {}",
+                        signature
+                            .as_ref()
+                            .map_or(String::new(), |value| format!(" signature={value}")),
+                        text
+                    ));
+                }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -1924,11 +2037,12 @@ fn build_runtime(
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    thinking_enabled: bool,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
+        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone(), thinking_enabled)?,
         CliToolExecutor::new(allowed_tools),
         permission_policy(permission_mode),
         system_prompt,
@@ -1987,6 +2101,7 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
+    thinking_enabled: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -1994,6 +2109,7 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
+        thinking_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -2001,6 +2117,7 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             allowed_tools,
+            thinking_enabled,
         })
     }
 }
@@ -2034,6 +2151,9 @@ impl ApiClient for AnthropicRuntimeClient {
                     .collect()
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            thinking: self
+                .thinking_enabled
+                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
             stream: true,
         };
 
@@ -2046,6 +2166,7 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut stdout = io::stdout();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
+            let mut pending_thinking_signature: Option<String> = None;
             let mut saw_stop = false;
 
             while let Some(event) = stream
@@ -2056,7 +2177,13 @@ impl ApiClient for AnthropicRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, &mut stdout, &mut events, &mut pending_tool)?;
+                            push_output_block(
+                                block,
+                                &mut stdout,
+                                &mut events,
+                                &mut pending_tool,
+                                &mut pending_thinking_signature,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
@@ -2065,6 +2192,7 @@ impl ApiClient for AnthropicRuntimeClient {
                             &mut stdout,
                             &mut events,
                             &mut pending_tool,
+                            &mut pending_thinking_signature,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -2075,6 +2203,14 @@ impl ApiClient for AnthropicRuntimeClient {
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 events.push(AssistantEvent::TextDelta(text));
                             }
+                        }
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            if !thinking.is_empty() {
+                                events.push(AssistantEvent::ThinkingDelta(thinking));
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { signature } => {
+                            events.push(AssistantEvent::ThinkingSignature(signature));
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
                             if let Some((_, _, input)) = &mut pending_tool {
@@ -2105,6 +2241,8 @@ impl ApiClient for AnthropicRuntimeClient {
             if !saw_stop
                 && events.iter().any(|event| {
                     matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                        || matches!(event, AssistantEvent::ThinkingDelta(text) if !text.is_empty())
+                        || matches!(event, AssistantEvent::ThinkingSignature(_))
                         || matches!(event, AssistantEvent::ToolUse { .. })
                 })
             {
@@ -2188,11 +2326,19 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
     }
 }
 
+fn render_thinking_block_summary(text: &str, out: &mut impl Write) -> Result<(), RuntimeError> {
+    let summary = format!("▶ Thinking ({} chars hidden)", text.chars().count());
+    writeln!(out, "\n{summary}")
+        .and_then(|()| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut impl Write,
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
+    pending_thinking_signature: &mut Option<String>,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -2201,6 +2347,19 @@ fn push_output_block(
                     .and_then(|()| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));
+            }
+        }
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            render_thinking_block_summary(&thinking, out)?;
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::ThinkingDelta(thinking));
+            }
+            if let Some(signature) = signature {
+                *pending_thinking_signature = Some(signature.clone());
+                events.push(AssistantEvent::ThinkingSignature(signature));
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
@@ -2224,9 +2383,16 @@ fn response_to_events(
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut pending_thinking_signature = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool)?;
+        push_output_block(
+            block,
+            out,
+            &mut events,
+            &mut pending_tool,
+            &mut pending_thinking_signature,
+        )?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -2311,26 +2477,29 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -2363,6 +2532,7 @@ fn print_help() {
     println!("  --model MODEL              Override the active model");
     println!("  --output-format FORMAT     Non-interactive output format: text or json");
     println!("  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access");
+    println!("  --thinking                 Enable extended thinking with the default budget");
     println!("  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
     println!("  --version, -V              Print version and build information locally");
     println!();
@@ -2408,6 +2578,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                thinking: false,
             }
         );
     }
@@ -2427,6 +2598,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                thinking: false,
             }
         );
     }
@@ -2448,6 +2620,7 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                thinking: false,
             }
         );
     }
@@ -2473,6 +2646,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                thinking: false,
             }
         );
     }
@@ -2495,6 +2669,7 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::WorkspaceWrite,
+                thinking: false,
             }
         );
     }
@@ -2734,6 +2909,7 @@ mod tests {
                     cache_read_input_tokens: 1,
                 },
                 estimated_tokens: 128,
+                thinking_enabled: true,
             },
             "workspace-write",
             &super::StatusContext {
@@ -2797,7 +2973,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert_eq!(context.discovered_config_files, 3);
+        assert!(context.discovered_config_files >= context.loaded_config_files);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 

@@ -17,6 +17,8 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    ThinkingDelta(String),
+    ThinkingSignature(String),
     ToolUse {
         id: String,
         name: String,
@@ -247,15 +249,26 @@ fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<(ConversationMessage, Option<TokenUsage>), RuntimeError> {
     let mut text = String::new();
+    let mut thinking = String::new();
+    let mut thinking_signature: Option<String> = None;
     let mut blocks = Vec::new();
     let mut finished = false;
     let mut usage = None;
 
     for event in events {
         match event {
-            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::TextDelta(delta) => {
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
+                text.push_str(&delta);
+            }
+            AssistantEvent::ThinkingDelta(delta) => {
+                flush_text_block(&mut text, &mut blocks);
+                thinking.push_str(&delta);
+            }
+            AssistantEvent::ThinkingSignature(signature) => thinking_signature = Some(signature),
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -266,6 +279,7 @@ fn build_assistant_message(
     }
 
     flush_text_block(&mut text, &mut blocks);
+    flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
 
     if !finished {
         return Err(RuntimeError::new(
@@ -286,6 +300,19 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
             text: std::mem::take(text),
+        });
+    }
+}
+
+fn flush_thinking_block(
+    thinking: &mut String,
+    signature: &mut Option<String>,
+    blocks: &mut Vec<ContentBlock>,
+) {
+    if !thinking.is_empty() || signature.is_some() {
+        blocks.push(ContentBlock::Thinking {
+            text: std::mem::take(thinking),
+            signature: signature.take(),
         });
     }
 }
@@ -325,8 +352,8 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError,
-        StaticToolExecutor,
+        build_assistant_message, ApiClient, ApiRequest, AssistantEvent, ConversationRuntime,
+        RuntimeError, StaticToolExecutor,
     };
     use crate::compact::CompactionConfig;
     use crate::permissions::{
@@ -408,7 +435,7 @@ mod tests {
                 .sum::<i32>();
             Ok(total.to_string())
         });
-        let permission_policy = PermissionPolicy::new(PermissionMode::Prompt);
+        let permission_policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
         let system_prompt = SystemPromptBuilder::new()
             .with_project_context(ProjectContext {
                 cwd: PathBuf::from("/tmp/project"),
@@ -487,7 +514,7 @@ mod tests {
             Session::new(),
             SingleCallApiClient,
             StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::Prompt),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         );
 
@@ -499,6 +526,29 @@ mod tests {
         assert!(matches!(
             &summary.tool_results[0].blocks[0],
             ContentBlock::ToolResult { is_error: true, output, .. } if output == "not now"
+        ));
+    }
+
+    #[test]
+    fn thinking_blocks_are_preserved_separately_from_text() {
+        let (message, usage) = build_assistant_message(vec![
+            AssistantEvent::ThinkingDelta("first ".to_string()),
+            AssistantEvent::ThinkingDelta("second".to_string()),
+            AssistantEvent::ThinkingSignature("sig-1".to_string()),
+            AssistantEvent::TextDelta("final".to_string()),
+            AssistantEvent::MessageStop,
+        ])
+        .expect("assistant message should build");
+
+        assert_eq!(usage, None);
+        assert!(matches!(
+            &message.blocks[0],
+            ContentBlock::Thinking { text, signature }
+                if text == "first second" && signature.as_deref() == Some("sig-1")
+        ));
+        assert!(matches!(
+            &message.blocks[1],
+            ContentBlock::Text { text } if text == "final"
         ));
     }
 
@@ -536,7 +586,7 @@ mod tests {
             session,
             SimpleApi,
             StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::Allow),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
 
@@ -563,7 +613,7 @@ mod tests {
             Session::new(),
             SimpleApi,
             StaticToolExecutor::new(),
-            PermissionPolicy::new(PermissionMode::Allow),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         );
         runtime.run_turn("a", None).expect("turn a");
