@@ -36,11 +36,10 @@ impl ProviderClient {
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
         match providers::detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => Ok(Self::Anthropic(
-                anthropic_auth
-                    .map(AnthropicClient::from_auth)
-                    .unwrap_or(AnthropicClient::from_env()?),
-            )),
+            ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
+                Some(auth) => AnthropicClient::from_auth(auth),
+                None => AnthropicClient::from_env()?,
+            })),
             ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::xai(),
             )?)),

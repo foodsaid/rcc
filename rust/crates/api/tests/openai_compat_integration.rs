@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use api::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig,
-    OutputContentBlock, StreamEvent, ToolChoice, ToolDefinition,
+    OutputContentBlock, ProviderClient, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -158,6 +160,43 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     assert!(request.body.contains("\"stream\":true"));
 }
 
+#[tokio::test]
+async fn provider_client_dispatches_xai_requests_from_env() {
+    let _lock = env_lock();
+    let _api_key = ScopedEnvVar::set("XAI_API_KEY", "xai-test-key");
+
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response(
+            "200 OK",
+            "application/json",
+            "{\"id\":\"chatcmpl_provider\",\"model\":\"grok-3\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Through provider client\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}",
+        )],
+    )
+    .await;
+    let _base_url = ScopedEnvVar::set("XAI_BASE_URL", server.base_url());
+
+    let client =
+        ProviderClient::from_model("grok").expect("xAI provider client should be constructed");
+    assert!(matches!(client, ProviderClient::Xai(_)));
+
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("provider-dispatched request should succeed");
+
+    assert_eq!(response.total_tokens(), 13);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/chat/completions");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer xai-test-key")
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     path: String,
@@ -308,5 +347,34 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         stream,
+    }
+}
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
     }
 }
