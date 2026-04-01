@@ -2557,6 +2557,8 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
+                        ContentBlockDelta::ThinkingDelta { .. }
+                        | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
@@ -3056,6 +3058,7 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
+        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
     Ok(())
 }
@@ -4006,5 +4009,44 @@ mod tests {
             AssistantEvent::ToolUse { name, input, .. }
                 if name == "read_file" && input == "{\"path\":\"rust/Cargo.toml\"}"
         ));
+    }
+
+    #[test]
+    fn response_to_events_ignores_thinking_blocks() {
+        let mut out = Vec::new();
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-3".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![
+                    OutputContentBlock::Thinking {
+                        thinking: "step 1".to_string(),
+                        signature: Some("sig_123".to_string()),
+                    },
+                    OutputContentBlock::Text {
+                        text: "Final answer".to_string(),
+                    },
+                ],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == "Final answer"
+        ));
+        assert!(!String::from_utf8(out).expect("utf8").contains("step 1"));
     }
 }

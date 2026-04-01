@@ -1953,6 +1953,8 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
+                        ContentBlockDelta::ThinkingDelta { .. }
+                        | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some((id, name, input)) = pending_tool.take() {
@@ -2147,6 +2149,7 @@ fn push_output_block(
             };
             *pending_tool = Some((id, name, initial_input));
         }
+        OutputContentBlock::Thinking { .. } | OutputContentBlock::RedactedThinking { .. } => {}
     }
 }
 
@@ -3192,8 +3195,9 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, execute_agent_with_spawn,
         execute_tool, final_assistant_text, mvp_tool_specs, persist_agent_terminal_state,
-        AgentInput, AgentJob, GlobalToolRegistry, SubagentToolExecutor,
+        response_to_events, AgentInput, AgentJob, GlobalToolRegistry, SubagentToolExecutor,
     };
+    use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
     use runtime::{
         ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError, Session, ToolExecutor,
@@ -4024,6 +4028,42 @@ mod tests {
             )));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn response_to_events_ignores_thinking_blocks() {
+        let events = response_to_events(MessageResponse {
+            id: "msg-1".to_string(),
+            kind: "message".to_string(),
+            model: "claude-opus-4-6".to_string(),
+            role: "assistant".to_string(),
+            content: vec![
+                OutputContentBlock::Thinking {
+                    thinking: "step 1".to_string(),
+                    signature: Some("sig_123".to_string()),
+                },
+                OutputContentBlock::Text {
+                    text: "Final answer".to_string(),
+                },
+            ],
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            request_id: None,
+        });
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == "Final answer"
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AssistantEvent::ToolUse { .. })));
     }
 
     #[test]
