@@ -4203,3 +4203,90 @@ ear], /color [scheme], /effort [low|medium|high], /fast, /summary, /tag [label],
      **Blocker.** Implementation work is sizable (~200 lines + tests + migration docs). Product decision needed: full Claude Code hooks compatibility as a goal, or subset-plus-adapter. The current schema is claw-code-native; Claude Code compat requires either extending or replacing.
 
      **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdWW` on main HEAD `b81e642` in response to Clawhip pinpoint nudge at `1494963222157983774`. Joins **Claude Code migration parity** (#103, #109, #116, #117, #119, #120) as 7th member — the most severe parity break since hooks is load-bearing automation infrastructure. Joins **Truth-audit / diagnostic-integrity** on misleading error message axis. Joins **Silent-flag / documented-but-unenforced** on NDJSON-output-violating-json-flag. Cross-cluster with **Unplumbed-subsystem** (#78, #96, #100, #102, #103, #107, #109, #111, #113) — hooks subsystem exists but schema is incompatible with the reference implementation. Natural bundle: **Claude Code migration parity septet (grown)**: #103 + #109 + #116 + #117 + #119 + #120 + **#121**. Complete coverage of every migration failure mode: silent drop (#103) + stderr prose warnings (#109) + hard-fail on unknown keys (#116) + prompt corruption from muscle memory (#117) + slash-verb fallthrough (#119) + JSON5-partial-accept + alias-inversion (#120) + hooks-schema-incompatible (#121). Also **#107 + #121** — hooks-subsystem pair: #107 hooks invisible to JSON diagnostics + #121 hooks schema incompatible with migration source. Also **NDJSON-violates-json-flag 2-way (new)**: #121 + probably more; worth sweep. Session tally: ROADMAP #121.
+
+122. **`--base-commit` accepts ANY string as its value with zero validation — no SHA-format check, no `git cat-file -e` probe, no rejection of values that start with `--` or match known subcommand names. The parser at `main.rs:487` greedily takes `args[index+1]` no matter what. So `claw --base-commit doctor` silently uses the literal string `"doctor"` as the base commit, absorbs the subcommand, falls through to Prompt dispatch, emits stderr `"warning: worktree HEAD (...) does not match expected base commit (doctor). Session may run against a stale codebase."` (using the bogus value verbatim), AND burns billable LLM tokens on an empty prompt. Similarly `claw --base-commit --model sonnet status` takes `--model` as the base-commit value, swallowing the model flag. Separately: the stale-base check runs ONLY on the Prompt path; `claw --output-format json --base-commit <mismatched> status` or `doctor` emit NO stale_base field in the JSON surface, silently dropping the signal (plumbing gap adjacent to #100)** — dogfooded 2026-04-18 on main HEAD `d1608ae` from `/tmp/cdYY`.
+
+     **Concrete repro.**
+     ```
+     $ cd /tmp/cdYY && git init -q .
+     $ echo base > file.txt && git add -A && git commit -q -m "base"
+     $ BASE_SHA=$(git rev-parse HEAD)
+     $ echo update >> file.txt && git commit -a -q -m "update"
+
+     # 1. Greedy swallow of subcommand name:
+     $ claw --base-commit doctor
+     warning: worktree HEAD (abab38...) does not match expected base commit (doctor). Session may run against a stale codebase.
+     error: missing Anthropic credentials; ...
+     # "doctor" used as base-commit value. Subcommand absorbed. Prompt fallthrough.
+     # Billable LLM call would have fired if credentials present.
+
+     # 2. Greedy swallow of flag:
+     $ claw --base-commit --model sonnet status
+     warning: worktree HEAD (abab38...) does not match expected base commit (--model). Session may run against a stale codebase.
+     error: missing Anthropic credentials; ...
+     # "--model" taken as base-commit value. "sonnet" + "status" remain as args.
+     # status action never dispatched; falls through to Prompt.
+
+     # 3. No validation on garbage string:
+     $ claw --base-commit garbage status
+     Status
+       Model            claude-opus-4-6
+       Permission mode  danger-full-access
+       ...
+     # "garbage" accepted silently. Status dispatched normally.
+     # No stale-base warning because status path doesn't run the check.
+
+     # 4. Empty string accepted:
+     $ claw --base-commit "" status
+     Status ...
+     # "" accepted as base-commit value. No error.
+
+     # 5. Stale-base signal MISSING from status/doctor JSON surface:
+     $ claw --output-format json --base-commit $BASE_SHA status
+     { "kind": "status", ... }   # no stale_base, no base_commit, no base_commit_mismatch field
+     $ claw --output-format json --base-commit $BASE_SHA doctor
+     { "kind": "doctor", "checks": [...] }
+     # Zero field references base_commit check in any surface.
+     # The stderr warning ONLY fires on Prompt path.
+     ```
+
+     **Trace path.**
+     - `rust/crates/rusty-claude-cli/src/main.rs:487-494` — `--base-commit` arg parsing:
+       ```rust
+       "--base-commit" => {
+           let value = args
+               .get(index + 1)
+               .ok_or_else(|| "missing value for --base-commit".to_string())?;
+           base_commit = Some(value.clone());
+           index += 2;
+       }
+       ```
+       No format validation. No reject-on-flag-prefix. No reject-on-known-subcommand.
+     - Compare `rust/crates/rusty-claude-cli/src/main.rs:498-510` — `--reasoning-effort` arg parsing: validates `"low" | "medium" | "high"`. Has a guard. `--base-commit` has none.
+     - `rust/crates/runtime/src/stale_base.rs` — `check_base_commit` runs on the Prompt/session-turn path (via `run_stale_base_preflight` at `main.rs:3058` or equivalent). The warning is `eprintln!`d as prose.
+     - No Status/Doctor handler calls the stale-base check or includes a `base_commit` / `base_commit_matches` / `stale_base` field in their JSON output.
+     - `grep -rn "stale_base\|base_commit_matches\|base_commit:" rust/crates/rusty-claude-cli/src/main.rs | grep -i "status\|doctor"` → zero matches. The diagnostic surfaces don't surface the diagnostic.
+
+     **Why this is specifically a clawability gap.**
+     1. *Greedy swallow of subcommands/flags.* `claw --base-commit doctor` was almost certainly meant as `claw --base-commit <sha> doctor` with a missing sha. Greedy consumption takes "doctor" as the value and proceeds silently. The user never learns what happened. Billable LLM call + wrong behavior.
+     2. *Zero validation on base-commit value.* An empty string, a garbage string, a flag name, and a 40-char SHA are all equally accepted. The value only matters if the stale-base check actually fires (Prompt path), at which point it's compared literally against worktree HEAD (it never matches because the value isn't a real hash, generating false-positive stale-base warnings).
+     3. *Stale-base signal only on stderr, only on Prompt path.* A claw running `claw --output-format json --base-commit $EXPECTED_SHA status` to preflight a workspace gets `kind: status, permission_mode: ...` with NO stale-base signal. The check exists in `stale_base.rs` (#100 covered the unplumbed existence); **#122 adds**: even when explicitly passed via flag, the check result is not surfaced to the JSON consumers.
+     4. *Error message lies about what happened.* `"expected base commit (doctor)"` — the word "(doctor)" is the bogus value, not a label. A user seeing this is confused: is "doctor" some hidden feature? No, it's their subcommand that got eaten.
+     5. *Joins parser-level trust gaps.* #108 (typo → Prompt), #117 (`-p` greedy), #119 (slash-verb + any arg → Prompt), **#122** (`--base-commit` greedy consumes next arg). Four distinct parser bugs where greedy or too-permissive consumption produces silent corruption.
+     6. *Adjacent to #100.* #100 said stale-base subsystem is unplumbed from status/doctor JSON. **#122** adds: explicit `--base-commit <sha>` flag is accepted, check runs on Prompt, but JSON surfaces still don't include the verdict. The flag's observable effect is ONLY stderr prose on Prompt invocations.
+     7. *CI/automation impact.* A CI pipeline doing `claw --base-commit $(git merge-base main HEAD) prompt "do work"` where the merge-base expands to an empty string or bogus value silently runs with the garbage value. If the garbage happens to not match HEAD, the stderr warning fires as prose; a log-consumer scraping `grep "does not match expected base commit"` might trigger on "(doctor)", "(--model)", or "(empty)" depending on the failure mode.
+
+     **Fix shape — validate `--base-commit`, plumb to JSON surfaces.**
+     1. *Validate the value at parse time.* Options:
+        - Reject values starting with `-` (they're probably the next flag): `if value.starts_with('-') { return Err("--base-commit requires a git commit reference, got a flag-like value '{value}'"); }` ~5 lines.
+        - Reject known-subcommand names: `if KNOWN_SUBCOMMANDS.contains(value) { return Err("--base-commit requires a value; '{value}' looks like a subcommand"); }` ~5 lines.
+        - Optionally: run `git cat-file -e {value}` to verify it's a real git object before accepting. ~10 lines (requires git to exist + callable).
+     2. *Plumb stale-base check into Status and Doctor JSON surfaces.* Add `base_commit: String?`, `base_commit_matches: bool?`, `stale_base_warning: String?` to the structured output when `--base-commit` is provided. ~25 lines.
+     3. *Emit the warning as a structured JSON event too, not just stderr prose.* When --output-format json is set, append `{type: "warning", kind: "stale_base", expected: "<sha>", actual: "<head>"}` to stdout. ~10 lines. (Or: include in the main JSON envelope, following the same pattern as `config_parse_errors` proposed in #120.)
+     4. *Regression tests.* (a) `--base-commit -` (flag-like) → error, not silent. (b) `--base-commit doctor` (subcommand name) → error or at least structured warning. (c) `--base-commit <garbage> status` → stale_base field in JSON output. (d) `--base-commit "" status` → empty string rejected at parse time.
+
+     **Acceptance.** `claw --base-commit doctor` errors at parse time with a helpful message. `claw --base-commit --model sonnet status` errors similarly. `claw --output-format json --base-commit <sha> status` includes structured stale-base fields in the JSON output. Greedy swallow of subcommands/flags is impossible. Billable-token-burn via flag mis-parsing is blocked.
+
+     **Blocker.** None. Parser refactor is localized.
+
+     **Source.** Jobdori dogfood 2026-04-18 against `/tmp/cdYY` on main HEAD `d1608ae` in response to Clawhip pinpoint nudge at `1494978319920136232`. Joins **Silent-flag / documented-but-unenforced** (#96–#101, #104, #108, #111, #115, #116, #117, #118, #119, #121) as 15th — `--base-commit` silently accepts garbage values. Joins **Parser-level trust gaps** via quartet → quintet: #108 (typo → Prompt), #117 (`-p` greedy), #119 (slash-verb + arg → Prompt), **#122** (`--base-commit` greedy consumes subcommand/flag). All four are parser-level "too eager" bugs. Joins **Parallel-entry-point asymmetry** (#91, #101, #104, #105, #108, #114, #117) as 8th — stale-base check is implemented for Prompt path but absent from Status/Doctor surfaces. Joins **Truth-audit / diagnostic-integrity** — warning message "expected base commit (doctor)" lies by including user's mistake as truth. Cross-cluster with **Unplumbed-subsystem** (#78, #96, #100, #102, #103, #107, #109, #111, #113, #121) — stale-base signal exists in runtime but not in JSON. Natural bundle: **Parser-level trust gap quintet (grown)**: #108 + #117 + #119 + #122 — billable-token silent-burn via parser too-eager consumption. Also **#100 + #122**: stale-base unplumbed (Jobdori #100) + `--base-commit` flag accepts anything (Jobdori #122). Complete stale-base-diagnostic-integrity coverage. Session tally: ROADMAP #122.
