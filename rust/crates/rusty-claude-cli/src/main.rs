@@ -11400,6 +11400,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
+        let _env_guard = env_lock();
+        let _cwd_guard = cwd_guard();
         let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
             .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
@@ -11407,6 +11409,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_allowed_tools_flag() {
+        let _env_guard = env_lock();
+        let _cwd_guard = cwd_guard();
         for raw in ["", ",,"] {
             let error = parse_args(&["--allowedTools".to_string(), raw.to_string()])
                 .expect_err("empty allowedTools should be rejected");
