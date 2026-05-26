@@ -990,7 +990,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             // (#696: emit a typed error instead of hanging indefinitely)
             // Skip this guard in test builds (parse_args tests run in non-TTY context).
             #[cfg(not(test))]
-            return Err("interactive_only: claw requires an interactive terminal (stdin is not a TTY and no prompt was provided — pipe a prompt or run in a TTY)".into());
+            // #746: newline before remediation so split_error_hint populates hint field
+            return Err("interactive_only: claw requires an interactive terminal.\nStdin is not a TTY and no prompt was provided — pipe a prompt with `echo 'task' | claw` or run `claw` in an interactive terminal.".into());
         }
         return Ok(CliAction::Repl {
             model,
