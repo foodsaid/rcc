@@ -2350,7 +2350,8 @@ fn parse_single_word_command_alias(
         return Some(Ok(CliAction::Help { output_format }));
     }
 
-    if rest.len() != 1 {
+    // #453: fire guard for multi-word commands too (claw cost list, claw model list, etc.)
+    if rest.is_empty() {
         return None;
     }
 
